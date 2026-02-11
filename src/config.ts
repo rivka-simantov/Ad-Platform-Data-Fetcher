@@ -2,11 +2,12 @@
  * Configuration module.
  *
  * Loads credentials from environment variables (via .env file)
- * and validates them before use.
+ * and validates all inputs before use.
  */
 
 import dotenv from "dotenv";
 import path from "path";
+import { ValidationError } from "./errors";
 
 // Load .env from the project root
 dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
@@ -18,8 +19,8 @@ export const API_VERSION = "v21.0";
 export const BASE_URL = `https://graph.facebook.com/${API_VERSION}`;
 
 /**
- * Maximum number of rows per page when fetching insights.
- * Facebook allows up to 500 by default; we use a reasonable batch size.
+ * Maximum number of ads per page when fetching from the /ads endpoint.
+ * Facebook allows up to 500 by default; we use the maximum for efficiency.
  */
 export const PAGE_LIMIT = 500;
 
@@ -28,7 +29,7 @@ export const MAX_RETRIES = 3;
 
 /**
  * Reads credentials from environment variables.
- * Throws an informative error if any required variable is missing.
+ * Throws a ValidationError if any required variable is missing.
  */
 export function loadCredentialsFromEnv(): {
   accessToken: string;
@@ -38,18 +39,21 @@ export function loadCredentialsFromEnv(): {
   const accountId = process.env.FB_ACCOUNT_ID;
 
   if (!accessToken) {
-    throw new Error(
+    throw new ValidationError(
       "Missing FB_ACCESS_TOKEN environment variable. " +
         "Copy .env.example to .env and fill in your access token."
     );
   }
 
   if (!accountId) {
-    throw new Error(
+    throw new ValidationError(
       "Missing FB_ACCOUNT_ID environment variable. " +
         "Copy .env.example to .env and fill in your ad account ID."
     );
   }
+
+  // Validate the account ID before returning
+  validateAccountId(accountId);
 
   return { accessToken, accountId };
 }
@@ -61,13 +65,41 @@ export function loadCredentialsFromEnv(): {
 export function validateDate(date: string): void {
   const regex = /^\d{4}-\d{2}-\d{2}$/;
   if (!regex.test(date)) {
-    throw new Error(
+    throw new ValidationError(
       `Invalid date format: "${date}". Expected YYYY-MM-DD.`
     );
   }
 
-  const parsed = new Date(date + "T00:00:00Z");
-  if (isNaN(parsed.getTime())) {
-    throw new Error(`Invalid date: "${date}" is not a valid calendar date.`);
+  const [year, month, day] = date.split("-").map(Number);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+
+  // Check that the Date object matches the input — if Date rolled over
+  // (e.g., Feb 30 → Mar 2), the values won't match.
+  if (
+    isNaN(parsed.getTime()) ||
+    parsed.getUTCFullYear() !== year ||
+    parsed.getUTCMonth() !== month - 1 ||
+    parsed.getUTCDate() !== day
+  ) {
+    throw new ValidationError(
+      `Invalid date: "${date}" is not a valid calendar date.`
+    );
+  }
+}
+
+/**
+ * Validates that the account ID is a numeric string.
+ *
+ * Facebook ad account IDs are purely numeric (e.g., "123456789").
+ * The "act_" prefix is added by our code — if the user passes "act_123",
+ * the URL would become "act_act_123" which would fail.
+ */
+export function validateAccountId(accountId: string): void {
+  if (!/^\d+$/.test(accountId)) {
+    throw new ValidationError(
+      `Invalid account ID: "${accountId}". ` +
+        `Expected a numeric string (without the "act_" prefix). ` +
+        `Example: "123456789".`
+    );
   }
 }

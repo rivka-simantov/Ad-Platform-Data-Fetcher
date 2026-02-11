@@ -13,10 +13,15 @@
 
 import path from "path";
 import fs from "fs";
-import { loadCredentialsFromEnv, validateDate } from "./config";
+import { loadCredentialsFromEnv, validateDate, validateAccountId } from "./config";
 import { fetchAdData } from "./fetcher";
-import { fetchAdStatuses } from "./statusFetcher";
 import { FetchParams, OutputFile } from "./types";
+import {
+  ValidationError,
+  AuthenticationError,
+  RateLimitError,
+  FacebookApiError,
+} from "./errors";
 
 // ─── Parse CLI arguments ─────────────────────────────────────────────────────
 
@@ -37,14 +42,16 @@ function parseArgs(): FetchParams {
 
   // If all three args are provided, use them directly
   if (args.length >= 3) {
+    const accountId = args[1];
+    validateAccountId(accountId);
     return {
       date,
-      accountId: args[1],
+      accountId,
       credentials: { accessToken: args[2] },
     };
   }
 
-  // Otherwise load from environment
+  // Otherwise load from environment (validation happens inside)
   const env = loadCredentialsFromEnv();
   return {
     date,
@@ -83,28 +90,47 @@ async function main(): Promise<void> {
     console.log(`  Account   : ${params.accountId}`);
     console.log("═══════════════════════════════════════════════════════\n");
 
-    // Step 1: Fetch ad-level hourly insights
+    // Fetch ad data (single API call with field expansion)
     const output = await fetchAdData(params);
 
-    // Step 2: Fetch ad statuses (Active, Paused, etc.) via a separate endpoint
-    if (output.data.length > 0) {
-      const adIds = output.data.map((row) => row.ad_id);
-      const statusMap = await fetchAdStatuses(adIds, params.credentials);
-
-      // Enrich each record with the ad's effective status
-      for (const record of output.data) {
-        (record as any).status = statusMap.get(record.ad_id) ?? "UNKNOWN";
-      }
-    }
-
-    // Step 3: Save to local JSON file
+    // Save to local JSON file
     const filePath = saveOutput(output, params.date, params.accountId);
 
     console.log(`💾 Output saved to: ${filePath}`);
     console.log(`   Total records: ${output.data.length}`);
+
+    // Print summary
+    const s = output.metadata.summary;
+    console.log(`\n   Summary:`);
+    console.log(`   ├─ Impressions : ${s.total_impressions.toLocaleString()}`);
+    console.log(`   ├─ Clicks      : ${s.total_clicks.toLocaleString()}`);
+    console.log(`   ├─ Spend       : ${s.total_spend.toFixed(2)}`);
+    console.log(`   ├─ Unique ads  : ${s.unique_ads}`);
+    console.log(`   ├─ Campaigns   : ${s.unique_campaigns}`);
+    console.log(`   └─ Ad Sets     : ${s.unique_adsets}`);
+
     console.log("\nDone!");
   } catch (error) {
-    console.error("\n❌ Error:", (error as Error).message);
+    // Provide user-friendly error messages based on error type
+    if (error instanceof ValidationError) {
+      console.error(`\n❌ Validation error: ${error.message}`);
+    } else if (error instanceof AuthenticationError) {
+      console.error(
+        `\n❌ Authentication error (code ${error.code}): ${error.message}\n` +
+          `   Please check that your access token is valid and has the "ads_read" permission.`
+      );
+    } else if (error instanceof RateLimitError) {
+      console.error(
+        `\n❌ Rate limit exceeded after retries: ${error.message}\n` +
+          `   Try again in a few minutes.`
+      );
+    } else if (error instanceof FacebookApiError) {
+      console.error(
+        `\n❌ Facebook API error (code ${error.code}): ${error.message}`
+      );
+    } else {
+      console.error("\n❌ Unexpected error:", (error as Error).message);
+    }
     process.exit(1);
   }
 }

@@ -4,15 +4,17 @@ A TypeScript CLI tool that fetches **ad-level, hourly performance data** from th
 
 ## Platform: Facebook (Meta) Marketing API
 
-This tool uses two Facebook Graph API endpoints:
+This tool uses a **single API call** with [Field Expansion](https://developers.facebook.com/docs/graph-api/using-graph-api/#field-expansion) to fetch both ad properties and performance metrics in one request:
 
-| Endpoint | Purpose |
-|---|---|
-| `GET /act_{id}/insights` | Fetch performance metrics (impressions, clicks, spend, ROAS, actions) at ad level with hourly breakdown |
-| `GET /?ids={ad_ids}` | Fetch effective status (Active, Paused, etc.) for each ad |
+```
+GET /act_{id}/ads?fields=effective_status,insights.time_range(...).breakdowns(...){metrics...}
+```
 
-**Why the Insights endpoint?**
-The `/insights` edge is the standard reporting endpoint in the Meta Marketing API. By setting `level=ad` and `breakdowns=hourly_stats_aggregated_by_advertiser_time_zone`, we get one row per ad per hour — exactly the granularity required.
+**Why this approach?**
+Instead of making two separate calls (one for insights, one for ad status), Field Expansion allows us to query the `/ads` endpoint and embed the insights data inside each ad object. This means we get `effective_status` (Active, Paused, etc.) and all performance metrics (impressions, clicks, spend, etc.) in a single request.
+
+**Why the Insights edge?**
+The `/insights` edge is the standard reporting endpoint in the Meta Marketing API ([docs](https://developers.facebook.com/docs/marketing-api/insights)). By using `breakdowns=hourly_stats_aggregated_by_advertiser_time_zone` ([docs](https://developers.facebook.com/docs/marketing-api/insights/breakdowns)), we get one row per ad per hour — exactly the granularity required.
 
 ## Prerequisites
 
@@ -64,6 +66,12 @@ The script generates a JSON file at:
 output/ad_data_<ACCOUNT_ID>_<DATE>.json
 ```
 
+### Running Tests
+
+```bash
+npm test
+```
+
 ## Output Schema
 
 ```jsonc
@@ -73,7 +81,15 @@ output/ad_data_<ACCOUNT_ID>_<DATE>.json
     "date": "2025-01-15",
     "platform": "facebook",
     "fetched_at": "2025-01-16T08:30:00.000Z",
-    "total_records": 48
+    "total_records": 48,
+    "summary": {
+      "total_impressions": 45000,
+      "total_clicks": 1200,
+      "total_spend": 350.50,
+      "unique_ads": 15,
+      "unique_campaigns": 3,
+      "unique_adsets": 5
+    }
   },
   "data": [
     {
@@ -89,6 +105,7 @@ output/ad_data_<ACCOUNT_ID>_<DATE>.json
       "ad_name": "Video Ad - Discount 20%",
       "currency": "USD",
       "status": "ACTIVE",
+      "objective": "OUTCOME_SALES",
       // Metrics
       "impressions": 1250,
       "clicks": 45,
@@ -121,6 +138,7 @@ output/ad_data_<ACCOUNT_ID>_<DATE>.json
 | `ad_name` | Ad display name |
 | `currency` | Account currency (e.g., USD, EUR) |
 | `status` | Ad effective status (ACTIVE, PAUSED, ARCHIVED, etc.) |
+| `objective` | Campaign objective (e.g., OUTCOME_SALES, OUTCOME_TRAFFIC) |
 
 ### Metrics (per record)
 
@@ -135,34 +153,67 @@ output/ad_data_<ACCOUNT_ID>_<DATE>.json
 
 ## Technical Details
 
+### Field Expansion (Single API Call)
+
+We use Facebook's [Field Expansion](https://developers.facebook.com/docs/graph-api/using-graph-api/#field-expansion) feature to combine what would normally be two separate API calls into one. The query:
+
+```
+/act_{id}/ads?fields=effective_status,insights.time_range({"since":"2025-01-15","until":"2025-01-15"}).breakdowns(hourly_stats_aggregated_by_advertiser_time_zone){impressions,clicks,spend,...}
+```
+
+Returns each ad with its status AND its hourly performance data nested inside.
+
 ### Pagination
 
-Facebook uses **cursor-based pagination**. The script follows the `paging.next` URL until no more pages are available, ensuring all data for the day is retrieved.
+Facebook uses **cursor-based pagination**. The script follows the `paging.next` URL automatically until no more pages are available. Pagination happens at the ads level — each page returns up to 500 ads, each with their nested hourly insights.
 
 ### Rate Limiting
 
-The script handles HTTP 429 responses by waiting 60 seconds before retrying. Server errors (5xx) are retried with exponential backoff (2s, 4s, 8s). A maximum of 3 retries is attempted.
+Facebook does **not** use standard HTTP 429 responses ([docs](https://developers.facebook.com/docs/marketing-api/overview/rate-limiting/)). Instead, rate-limit errors are returned as JSON with specific error codes (`4`, `17`, `613`, `80000`, `80003`, `80004`, `80014`).
+
+The script handles this by:
+- Detecting Facebook-specific rate-limit error codes in the response body.
+- Reading the `X-Business-Use-Case-Usage` header for the recommended wait time (`estimated_time_to_regain_access`).
+- Logging utilization percentages from the `X-FB-Ads-Insights-Throttle` header.
+- Falling back to a 5-minute wait (safe for the Development tier) if headers are unavailable.
+- Retrying up to 3 times with exponential backoff + **random jitter** to avoid thundering herd.
+
+Server errors (5xx) and network errors are retried with exponential backoff + jitter.
+
+### Input Validation
+
+All inputs are validated before making API calls:
+- **Date**: Must be in `YYYY-MM-DD` format and represent a real calendar date (e.g., `2025-02-30` is rejected).
+- **Account ID**: Must be a numeric string. If the user accidentally includes the `act_` prefix, a clear error message explains the expected format.
+- **Credentials**: Missing environment variables produce actionable error messages.
 
 ### Error Handling
 
-- **Missing credentials**: Clear error message pointing to `.env` setup
-- **Invalid date format**: Validates YYYY-MM-DD before making API calls
-- **Authentication errors (401/403)**: Reported immediately with the API error message
-- **Empty data**: Produces a valid JSON file with an empty `data` array
-- **Network errors**: Retried with backoff
+The script uses **custom error classes** for precise error handling:
+
+| Error Class | When | Retry? |
+|---|---|---|
+| `ValidationError` | Invalid date, bad account ID, missing credentials | No |
+| `AuthenticationError` | Expired token, insufficient permissions (codes 190, 10, 200) | No |
+| `RateLimitError` | API rate limit exceeded (codes 4, 17, 613, 80000+) | Yes, with wait |
+| `FacebookApiError` | Other API errors | No |
+
+Each error type produces a user-friendly message with actionable guidance.
 
 ## Project Structure
 
 ```
 ├── src/
 │   ├── index.ts          # CLI entry point, orchestration
-│   ├── fetcher.ts        # Insights API fetcher with pagination
-│   ├── statusFetcher.ts  # Ad status fetcher (/ads endpoint)
-│   ├── config.ts         # Configuration, env loading, validation
-│   └── types.ts          # TypeScript interfaces
+│   ├── fetcher.ts        # Ads + Insights fetcher (field expansion, pagination, rate limiting)
+│   ├── config.ts         # Configuration, env loading, input validation
+│   ├── errors.ts         # Custom error classes
+│   ├── types.ts          # TypeScript interfaces
+│   └── index.test.ts     # Unit tests (25 tests)
 ├── output/               # Generated JSON files
 ├── .env.example          # Template for credentials
 ├── .gitignore
+├── jest.config.ts        # Test configuration
 ├── package.json
 ├── tsconfig.json
 └── README.md

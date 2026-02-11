@@ -1,31 +1,27 @@
 /**
- * Facebook (Meta) Marketing API – Ad Insights Fetcher
+ * Facebook (Meta) Marketing API – Ad Data Fetcher
  *
- * This module is responsible for:
- * 1. Calling the Insights endpoint on the Meta Marketing API.
- * 2. Requesting ad-level data with hourly time breakdown.
- * 3. Handling cursor-based pagination to retrieve all rows.
- * 4. Handling Facebook-specific rate limits (error codes in JSON body).
- * 5. Normalizing the raw API response into a clean data model.
+ * This module fetches ad-level hourly performance data using a SINGLE API call
+ * via Facebook's Field Expansion feature. Instead of making two separate calls
+ * (one for insights, one for ad status), we query the /ads endpoint and embed
+ * the insights data inside each ad object using the syntax:
  *
- * API reference:
- *   https://developers.facebook.com/docs/marketing-api/insights
- *   https://developers.facebook.com/docs/marketing-api/insights/parameters
+ *   GET /act_{id}/ads?fields=effective_status,insights.time_range(...).breakdowns(...){fields...}
  *
- * Rate limiting reference:
- *   https://developers.facebook.com/docs/marketing-api/overview/rate-limiting
+ * This returns each ad object with its `effective_status` AND a nested
+ * `insights` block containing the hourly performance metrics.
  *
- * Why the Insights endpoint?
- *   The /insights edge is the standard way to pull aggregated performance
- *   metrics (impressions, clicks, spend, actions, etc.) from the Meta
- *   Marketing API. By setting `level=ad` we get one row per ad, and by
- *   adding `breakdowns=hourly_stats_aggregated_by_advertiser_time_zone`
- *   we split each ad's metrics into 24 hourly buckets.
+ * API references:
+ *   Insights API:       https://developers.facebook.com/docs/marketing-api/insights
+ *   Field Expansion:    https://developers.facebook.com/docs/graph-api/using-graph-api/#field-expansion
+ *   Breakdowns:         https://developers.facebook.com/docs/marketing-api/insights/breakdowns
+ *   Rate Limiting:      https://developers.facebook.com/docs/marketing-api/overview/rate-limiting
  */
 
 import {
   FetchParams,
-  FacebookInsightsResponse,
+  FacebookAdsResponse,
+  FacebookAdObject,
   FacebookInsightRow,
   AdHourlyRecord,
   OutputFile,
@@ -35,11 +31,29 @@ import {
   PAGE_LIMIT,
   MAX_RETRIES,
 } from "./config";
+import {
+  FacebookApiError,
+  RateLimitError,
+  AuthenticationError,
+} from "./errors";
 
 // ─── Helper: sleep ───────────────────────────────────────────────────────────
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Computes a backoff delay with jitter for retry attempts.
+ *
+ * Uses exponential backoff (2^attempt seconds) plus a random jitter of 0–1s.
+ * Jitter prevents the "thundering herd" problem where multiple clients
+ * that were rate-limited at the same time all retry simultaneously.
+ */
+function backoffWithJitter(attempt: number): number {
+  const base = 2 ** attempt * 1000;       // 2s, 4s, 8s…
+  const jitter = Math.random() * 1000;    // 0–1s random jitter
+  return base + jitter;
 }
 
 // ─── Facebook rate-limit error codes ─────────────────────────────────────────
@@ -53,19 +67,27 @@ function sleep(ms: number): Promise<void> {
  *   Code 613 → General call limit / abuse prevention
  *   Code 80000, 80003, 80004, 80014 → Business Use Case rate limits
  *
- * When rate-limited, Facebook blocks requests for a specific duration:
+ * When rate-limited, Facebook blocks requests for a duration that depends
+ * on the API access tier:
  *   - Development tier: 300 seconds (5 minutes)
  *   - Standard tier: 60 seconds
  *
- * We read the `X-FB-Ads-Insights-Throttle` header to check utilization %
- * and the `X-Business-Use-Case` header for estimated time to regain access.
+ * We read the response headers to determine the optimal wait time.
  */
 const RATE_LIMIT_ERROR_CODES = new Set([4, 17, 613, 80000, 80003, 80004, 80014]);
+
+/**
+ * Facebook authentication error codes:
+ *   Code 190 → Invalid or expired access token
+ *   Code 10  → Insufficient permissions
+ *   Code 200 → Permission error (requires specific permission)
+ */
+const AUTH_ERROR_CODES = new Set([190, 10, 200]);
 
 /** Default wait time when rate-limited (5 minutes — safe for development tier) */
 const DEFAULT_RATE_LIMIT_WAIT_MS = 5 * 60 * 1000;
 
-interface FacebookErrorResponse {
+interface FacebookErrorBody {
   error?: {
     code?: number;
     error_subcode?: number;
@@ -76,22 +98,32 @@ interface FacebookErrorResponse {
 /**
  * Checks if a Facebook API JSON response contains a rate-limit error.
  */
-function isRateLimitError(body: FacebookErrorResponse): boolean {
+function isRateLimitError(body: FacebookErrorBody): boolean {
   return !!body.error?.code && RATE_LIMIT_ERROR_CODES.has(body.error.code);
 }
 
 /**
- * Extracts the recommended wait time from the `X-Business-Use-Case` header,
- * which contains `estimated_time_to_regain_access` (in minutes).
- * Falls back to a safe default if the header is missing or unparseable.
+ * Checks if a Facebook API JSON response contains an authentication error.
+ */
+function isAuthError(body: FacebookErrorBody): boolean {
+  return !!body.error?.code && AUTH_ERROR_CODES.has(body.error.code);
+}
+
+/**
+ * Extracts the recommended wait time from response headers.
+ *
+ * Facebook provides two relevant headers:
+ *   - X-Business-Use-Case-Usage: contains `estimated_time_to_regain_access` (minutes)
+ *   - X-FB-Ads-Insights-Throttle: contains utilization percentages
+ *
+ * Falls back to a safe default (5 min) if headers are missing or unparseable.
  */
 function getWaitTimeFromHeaders(response: Response): number {
-  // Try the X-Business-Use-Case header first
+  // Try the X-Business-Use-Case-Usage header first
   const bucHeader = response.headers.get("x-business-use-case-usage");
   if (bucHeader) {
     try {
       const parsed = JSON.parse(bucHeader);
-      // The header is keyed by account ID; pick the first one
       const firstKey = Object.keys(parsed)[0];
       if (firstKey && Array.isArray(parsed[firstKey])) {
         const entry = parsed[firstKey][0];
@@ -100,11 +132,11 @@ function getWaitTimeFromHeaders(response: Response): number {
         }
       }
     } catch {
-      // Header exists but is not parseable — fall through to default
+      // Header exists but is not parseable — fall through
     }
   }
 
-  // Try the X-FB-Ads-Insights-Throttle header to log utilization
+  // Log utilization from the Insights Throttle header if available
   const insightsThrottle = response.headers.get("x-fb-ads-insights-throttle");
   if (insightsThrottle) {
     try {
@@ -124,12 +156,14 @@ function getWaitTimeFromHeaders(response: Response): number {
 // ─── HTTP wrapper with retry logic ───────────────────────────────────────────
 
 /**
- * Performs a GET request using the native `fetch` API (available in Node 18+).
- * Handles:
- *   - Facebook rate-limit errors (error codes 4, 17, 613, 80000–80014):
- *     waits the recommended time from response headers, then retries.
- *   - HTTP 5xx (server error): retries with exponential backoff.
- *   - Other HTTP errors: throws immediately (no retry).
+ * Performs a GET request with retry logic for:
+ *   - Facebook rate-limit errors (codes 4, 17, 613, 80000–80014)
+ *   - Server errors (HTTP 5xx) with exponential backoff + jitter
+ *   - Network failures (ECONNRESET, fetch failures)
+ *
+ * Throws immediately (no retry) for:
+ *   - Authentication errors (expired token, missing permissions)
+ *   - Other client errors (bad request, etc.)
  */
 async function fetchWithRetry(url: string): Promise<unknown> {
   let lastError: Error | null = null;
@@ -138,29 +172,40 @@ async function fetchWithRetry(url: string): Promise<unknown> {
     try {
       const response = await fetch(url);
 
-      // ── Server error – retry with backoff ────────────────────────────
+      // ── Server error – retry with exponential backoff + jitter ────────
       if (response.status >= 500) {
-        const backoff = 2 ** attempt * 1000; // 2s, 4s, 8s…
+        const backoff = backoffWithJitter(attempt);
         console.warn(
           `⚠  Server error ${response.status} (attempt ${attempt}/${MAX_RETRIES}). ` +
-            `Retrying in ${backoff / 1000}s…`
+            `Retrying in ${(backoff / 1000).toFixed(1)}s…`
         );
         await sleep(backoff);
         continue;
       }
 
-      // Parse the response body
-      const body = await response.json() as FacebookErrorResponse & FacebookInsightsResponse;
+      const body = await response.json() as FacebookErrorBody;
 
-      // ── Facebook rate-limit error handling ────────────────────────────
-      // Facebook returns rate-limit errors as HTTP 400 with error codes
-      // in the JSON body, NOT as HTTP 429.
+      // ── Authentication error – throw immediately, no retry ───────────
+      if (body.error && isAuthError(body)) {
+        throw new AuthenticationError(
+          body.error.message ?? "Authentication failed",
+          body.error.code,
+          body.error.error_subcode
+        );
+      }
+
+      // ── Facebook rate-limit error – wait and retry ───────────────────
       if (body.error && isRateLimitError(body)) {
         const waitMs = getWaitTimeFromHeaders(response);
+        const err = new RateLimitError(
+          body.error.message ?? "Rate limited",
+          body.error.code,
+          body.error.error_subcode,
+          waitMs
+        );
         console.warn(
-          `⚠  Rate limited by Facebook (error code ${body.error.code}, ` +
-            `subcode ${body.error.error_subcode ?? "none"}). ` +
-            `Message: "${body.error.message}". ` +
+          `⚠  ${err.name} (code ${err.code}, subcode ${err.subcode ?? "none"}). ` +
+            `Message: "${err.message}". ` +
             `Waiting ${Math.round(waitMs / 1000)}s before retry ` +
             `(attempt ${attempt}/${MAX_RETRIES})…`
         );
@@ -168,32 +213,44 @@ async function fetchWithRetry(url: string): Promise<unknown> {
         continue;
       }
 
-      // ── Other API errors – throw immediately ─────────────────────────
+      // ── Other API error – throw immediately ──────────────────────────
       if (body.error) {
-        throw new Error(
-          `Facebook API error (code ${body.error.code}): ${body.error.message}`
+        throw new FacebookApiError(
+          body.error.message ?? "Unknown Facebook API error",
+          body.error.code,
+          body.error.error_subcode
         );
       }
 
       if (!response.ok) {
-        throw new Error(
-          `Facebook API HTTP error ${response.status}: ${JSON.stringify(body)}`
+        throw new FacebookApiError(
+          `HTTP error ${response.status}: ${JSON.stringify(body)}`,
+          response.status,
+          undefined
         );
       }
 
       return body;
     } catch (err) {
+      // Don't retry auth errors or known API errors
+      if (
+        err instanceof AuthenticationError ||
+        err instanceof FacebookApiError
+      ) {
+        throw err;
+      }
+
       lastError = err as Error;
 
-      // Network errors are retried
+      // Network errors are retried with backoff + jitter
       if (
         lastError.message.includes("fetch failed") ||
         lastError.message.includes("ECONNRESET")
       ) {
-        const backoff = 2 ** attempt * 1000;
+        const backoff = backoffWithJitter(attempt);
         console.warn(
           `⚠  Network error (attempt ${attempt}/${MAX_RETRIES}): ${lastError.message}. ` +
-            `Retrying in ${backoff / 1000}s…`
+            `Retrying in ${(backoff / 1000).toFixed(1)}s…`
         );
         await sleep(backoff);
         continue;
@@ -203,30 +260,33 @@ async function fetchWithRetry(url: string): Promise<unknown> {
     }
   }
 
-  throw new Error(
-    `Failed after ${MAX_RETRIES} retries. Last error: ${lastError?.message}`
+  throw new FacebookApiError(
+    `Failed after ${MAX_RETRIES} retries. Last error: ${lastError?.message}`,
+    undefined,
+    undefined
   );
 }
 
-// ─── Build the Insights API URL ──────────────────────────────────────────────
+// ─── Build the /ads URL with Field Expansion ─────────────────────────────────
 
 /**
- * Constructs the initial URL for the /insights endpoint.
+ * Constructs the URL for GET /act_{id}/ads using Field Expansion to embed
+ * insights data inside each ad object.
  *
- * Key parameters:
- *   - level=ad                → one row per ad
- *   - breakdowns=hourly_stats_aggregated_by_advertiser_time_zone
- *                             → splits data into hourly buckets
- *   - time_range              → restricts to the single requested day
- *   - fields                  → the metrics and dimensions we need
- *   - limit                   → page size for cursor-based pagination
+ * The resulting URL looks like:
+ *   /act_{id}/ads?fields=effective_status,insights.time_range({...}).breakdowns(...){fields}
+ *
+ * This fetches both:
+ *   - Ad object properties: id, effective_status
+ *   - Nested insights: hourly metrics for the requested day
+ *
+ * Exported for unit testing.
  */
-function buildInsightsUrl(params: FetchParams): string {
+export function buildAdsUrl(params: FetchParams): string {
   const { date, accountId, credentials } = params;
 
-  // Fields we request from the API
-  const fields = [
-    // Dimensions / metadata
+  // Fields we want from the nested insights block
+  const insightsFields = [
     "account_id",
     "account_currency",
     "campaign_id",
@@ -235,7 +295,7 @@ function buildInsightsUrl(params: FetchParams): string {
     "adset_name",
     "ad_id",
     "ad_name",
-    // Metrics
+    "objective",
     "impressions",
     "clicks",
     "spend",
@@ -244,46 +304,51 @@ function buildInsightsUrl(params: FetchParams): string {
     "purchase_roas",
   ].join(",");
 
-  const timeRange = JSON.stringify({ since: date, until: date });
+  // Build the field expansion expression for insights
+  // Syntax: insights.time_range({...}).breakdowns(...){field1,field2,...}
+  const timeRange = `{"since":"${date}","until":"${date}"}`;
+  const insightsExpansion =
+    `insights` +
+    `.time_range(${timeRange})` +
+    `.breakdowns(hourly_stats_aggregated_by_advertiser_time_zone)` +
+    `{${insightsFields}}`;
+
+  // Top-level fields: ad properties + nested insights
+  const fields = `effective_status,${insightsExpansion}`;
 
   const queryParams = new URLSearchParams({
     access_token: credentials.accessToken,
-    level: "ad",
-    breakdowns: "hourly_stats_aggregated_by_advertiser_time_zone",
-    time_range: timeRange,
     fields,
     limit: String(PAGE_LIMIT),
   });
 
-  return `${BASE_URL}/act_${accountId}/insights?${queryParams.toString()}`;
+  return `${BASE_URL}/act_${accountId}/ads?${queryParams.toString()}`;
 }
 
-// ─── Fetch all pages of insights ─────────────────────────────────────────────
+// ─── Fetch all pages of ads ──────────────────────────────────────────────────
 
 /**
- * Fetches ALL rows of insight data for the given parameters,
- * automatically following pagination cursors until no more pages remain.
+ * Fetches ALL ad objects (with nested insights) from the account,
+ * following pagination cursors until no more pages remain.
  */
-async function fetchAllInsights(
-  params: FetchParams
-): Promise<FacebookInsightRow[]> {
-  const allRows: FacebookInsightRow[] = [];
-  let url: string | null = buildInsightsUrl(params);
+async function fetchAllAds(params: FetchParams): Promise<FacebookAdObject[]> {
+  const allAds: FacebookAdObject[] = [];
+  let url: string | null = buildAdsUrl(params);
   let pageNum = 1;
 
   while (url) {
     console.log(`   Fetching page ${pageNum}…`);
 
-    const response = (await fetchWithRetry(url)) as FacebookInsightsResponse;
+    const response = (await fetchWithRetry(url)) as FacebookAdsResponse;
 
     if (response.data && response.data.length > 0) {
-      allRows.push(...response.data);
+      allAds.push(...response.data);
       console.log(
-        `   ✓ Page ${pageNum}: received ${response.data.length} rows ` +
-          `(total so far: ${allRows.length})`
+        `   ✓ Page ${pageNum}: received ${response.data.length} ads ` +
+          `(total so far: ${allAds.length})`
       );
     } else {
-      console.log(`   ✓ Page ${pageNum}: no data returned.`);
+      console.log(`   ✓ Page ${pageNum}: no ads returned.`);
     }
 
     // Move to next page if available
@@ -291,20 +356,25 @@ async function fetchAllInsights(
     pageNum++;
   }
 
-  return allRows;
+  return allAds;
 }
 
 // ─── Normalize raw data into clean output ────────────────────────────────────
 
 /**
- * Transforms a raw Facebook insight row into our normalized AdHourlyRecord.
+ * Transforms a raw Facebook insight row + ad status into a normalized record.
  *
  * Notable transformations:
  *   - Numeric strings → numbers
  *   - actions array → simplified { type, count } objects
- *   - purchase_roas / purchase action_values → extracted if present
+ *   - purchase_roas / action_values → extracted if present
+ *
+ * Exported for unit testing.
  */
-function normalizeRow(row: FacebookInsightRow): AdHourlyRecord {
+export function normalizeRow(
+  row: FacebookInsightRow,
+  status: string
+): AdHourlyRecord {
   // Extract purchase ROAS (if available)
   const purchaseRoas =
     row.purchase_roas?.find((r) => r.action_type === "omni_purchase")?.value ??
@@ -334,7 +404,8 @@ function normalizeRow(row: FacebookInsightRow): AdHourlyRecord {
     ad_id: row.ad_id,
     ad_name: row.ad_name,
     currency: row.account_currency,
-    status: "UNKNOWN", // Enriched later via the /ads endpoint in index.ts
+    status,
+    objective: row.objective,
     impressions: Number(row.impressions),
     clicks: Number(row.clicks),
     spend: Number(row.spend),
@@ -344,11 +415,32 @@ function normalizeRow(row: FacebookInsightRow): AdHourlyRecord {
   };
 }
 
+// ─── Summary statistics ──────────────────────────────────────────────────────
+
+/**
+ * Computes aggregate summary statistics across all hourly records.
+ * Included in the output metadata for quick data validation.
+ */
+function computeSummary(records: AdHourlyRecord[]) {
+  const uniqueAds = new Set(records.map((r) => r.ad_id));
+  const uniqueCampaigns = new Set(records.map((r) => r.campaign_id));
+  const uniqueAdSets = new Set(records.map((r) => r.adset_id));
+
+  return {
+    total_impressions: records.reduce((sum, r) => sum + r.impressions, 0),
+    total_clicks: records.reduce((sum, r) => sum + r.clicks, 0),
+    total_spend: Math.round(records.reduce((sum, r) => sum + r.spend, 0) * 100) / 100,
+    unique_ads: uniqueAds.size,
+    unique_campaigns: uniqueCampaigns.size,
+    unique_adsets: uniqueAdSets.size,
+  };
+}
+
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /**
  * Main entry point: fetches ad-level hourly performance data for a single day
- * from the Facebook Marketing API.
+ * from the Facebook Marketing API using a single API call with Field Expansion.
  *
  * @param params - date, accountId, and credentials
  * @returns A complete OutputFile object ready to be written to disk as JSON.
@@ -358,16 +450,29 @@ export async function fetchAdData(params: FetchParams): Promise<OutputFile> {
     `\n📊 Fetching ad data for account ${params.accountId} on ${params.date}…\n`
   );
 
-  const rawRows = await fetchAllInsights(params);
+  // Single API call: fetch ads with nested insights via field expansion
+  const ads = await fetchAllAds(params);
 
-  if (rawRows.length === 0) {
+  // Flatten: each ad may have multiple hourly insight rows
+  const normalizedData: AdHourlyRecord[] = [];
+
+  for (const ad of ads) {
+    const status = ad.effective_status ?? "UNKNOWN";
+    const insightRows = ad.insights?.data ?? [];
+
+    for (const row of insightRows) {
+      normalizedData.push(normalizeRow(row, status));
+    }
+  }
+
+  if (normalizedData.length === 0) {
     console.log(
       "\n⚠  No data returned for the given date and account. " +
         "The output file will contain an empty data array.\n"
     );
   }
 
-  const normalizedData = rawRows.map(normalizeRow);
+  const summary = computeSummary(normalizedData);
 
   const output: OutputFile = {
     metadata: {
@@ -376,11 +481,14 @@ export async function fetchAdData(params: FetchParams): Promise<OutputFile> {
       platform: "facebook",
       fetched_at: new Date().toISOString(),
       total_records: normalizedData.length,
+      summary,
     },
     data: normalizedData,
   };
 
-  console.log(`\n✅ Fetched and normalized ${normalizedData.length} records.\n`);
+  console.log(
+    `\n✅ Fetched ${ads.length} ads → ${normalizedData.length} hourly records.\n`
+  );
 
   return output;
 }

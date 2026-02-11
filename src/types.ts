@@ -3,6 +3,10 @@
  *
  * Based on the Meta Marketing API Insights endpoint:
  * https://developers.facebook.com/docs/marketing-api/insights
+ *
+ * We use Field Expansion to fetch ad object properties (like effective_status)
+ * together with insights data in a single API call:
+ * https://developers.facebook.com/docs/graph-api/using-graph-api/#field-expansion
  */
 
 // ─── Credentials & Configuration ─────────────────────────────────────────────
@@ -35,7 +39,7 @@ export interface FacebookActionValue {
   value: string;
 }
 
-/** Raw insight row returned by the Facebook Marketing API */
+/** Raw insight row returned inside the field-expansion `insights` block */
 export interface FacebookInsightRow {
   account_id: string;
   account_currency: string;
@@ -45,6 +49,7 @@ export interface FacebookInsightRow {
   adset_name: string;
   ad_id: string;
   ad_name: string;
+  objective: string;
   impressions: string;
   clicks: string;
   spend: string;
@@ -65,9 +70,25 @@ export interface FacebookPaging {
   next?: string;
 }
 
-/** Facebook API insights response envelope */
-export interface FacebookInsightsResponse {
+/** The nested insights object inside each ad (field expansion response) */
+export interface FacebookInsightsBlock {
   data: FacebookInsightRow[];
+  paging?: FacebookPaging;
+}
+
+/**
+ * A single ad object returned by GET /act_{id}/ads with field expansion.
+ * Contains ad-level properties (id, effective_status) and a nested `insights` block.
+ */
+export interface FacebookAdObject {
+  id: string;
+  effective_status: string;
+  insights?: FacebookInsightsBlock;
+}
+
+/** Response envelope from GET /act_{id}/ads */
+export interface FacebookAdsResponse {
+  data: FacebookAdObject[];
   paging?: FacebookPaging;
 }
 
@@ -92,8 +113,10 @@ export interface AdHourlyRecord {
   ad_id: string;
   ad_name: string;
   currency: string;
-  /** Ad effective status (Active, Paused, Archived, etc.) — fetched from /ads endpoint */
+  /** Ad effective status (ACTIVE, PAUSED, ARCHIVED, etc.) */
   status: string;
+  /** Campaign objective (e.g., OUTCOME_SALES, OUTCOME_TRAFFIC) */
+  objective: string;
 
   // Metrics
   impressions: number;
@@ -104,6 +127,16 @@ export interface AdHourlyRecord {
   actions: ActionEntry[];
 }
 
+/** Aggregate summary statistics for the output */
+export interface OutputSummary {
+  total_impressions: number;
+  total_clicks: number;
+  total_spend: number;
+  unique_ads: number;
+  unique_campaigns: number;
+  unique_adsets: number;
+}
+
 /** The full output file schema */
 export interface OutputFile {
   metadata: {
@@ -112,6 +145,8 @@ export interface OutputFile {
     platform: string;
     fetched_at: string;
     total_records: number;
+    /** Aggregate statistics for quick data validation */
+    summary: OutputSummary;
   };
   data: AdHourlyRecord[];
 }
