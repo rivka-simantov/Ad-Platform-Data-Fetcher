@@ -1,0 +1,21 @@
+{
+  "name": "ad-platform-data-fetcher",
+  "version": "1.0.0",
+  "description": "Fetches ad-level performance data from Facebook (Meta) Marketing API and saves it locally as JSON",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/index.ts",
+    "fetch": "ts-node src/index.ts"
+  },
+  "keywords": ["facebook-ads", "meta", "marketing-api", "ad-data", "reporting"],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "ts-node": "^10.0.0"
+  }
+}
