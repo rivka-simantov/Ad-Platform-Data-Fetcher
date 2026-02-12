@@ -210,9 +210,14 @@ describe("buildAdsUrl", () => {
     }
   });
 
-  it("includes the page limit", () => {
+  it("includes the default page limit", () => {
     const url = buildAdsUrl(params);
-    expect(url).toContain("limit=500");
+    expect(url).toContain("limit=50");
+  });
+
+  it("accepts a custom page limit override", () => {
+    const url = buildAdsUrl(params, 25);
+    expect(url).toContain("limit=25");
   });
 });
 

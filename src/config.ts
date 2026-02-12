@@ -20,9 +20,20 @@ export const BASE_URL = `https://graph.facebook.com/${API_VERSION}`;
 
 /**
  * Maximum number of ads per page when fetching from the /ads endpoint.
- * Facebook allows up to 500 by default; we use the maximum for efficiency.
+ *
+ * We use a conservative default (50) rather than Facebook's maximum (500)
+ * because with hourly breakdowns each ad can produce up to 24 insight rows.
+ * A high limit risks hitting Facebook's "data per call" threshold
+ * (error subcode 1487534), which rejects the entire response.
  */
-export const PAGE_LIMIT = 500;
+export const PAGE_LIMIT = 50;
+
+/**
+ * Minimum page limit we'll reduce to when handling data-per-call errors.
+ * If we're still hitting the limit at this size, we throw instead of
+ * reducing further.
+ */
+export const MIN_PAGE_LIMIT = 10;
 
 /** Maximum number of retries on transient / rate-limit errors */
 export const MAX_RETRIES = 3;

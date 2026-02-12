@@ -29,6 +29,7 @@ import {
 import {
   BASE_URL,
   PAGE_LIMIT,
+  MIN_PAGE_LIMIT,
   MAX_RETRIES,
 } from "./config";
 import {
@@ -84,6 +85,16 @@ const RATE_LIMIT_ERROR_CODES = new Set([4, 17, 613, 80000, 80003, 80004, 80014])
  */
 const AUTH_ERROR_CODES = new Set([190, 10, 200]);
 
+/**
+ * Facebook "data per call" limit error subcode.
+ *
+ * When using hourly breakdowns, each ad can produce up to 24 insight rows.
+ * If the page size is too large, the total data volume exceeds Facebook's
+ * per-request threshold and the API returns error subcode 1487534.
+ * Our strategy: catch this error, halve the page limit, and retry.
+ */
+const DATA_LIMIT_SUBCODE = 1487534;
+
 /** Default wait time when rate-limited (5 minutes — safe for development tier) */
 const DEFAULT_RATE_LIMIT_WAIT_MS = 5 * 60 * 1000;
 
@@ -107,6 +118,15 @@ function isRateLimitError(body: FacebookErrorBody): boolean {
  */
 function isAuthError(body: FacebookErrorBody): boolean {
   return !!body.error?.code && AUTH_ERROR_CODES.has(body.error.code);
+}
+
+/**
+ * Checks if a Facebook API error is a "data per call limit" error (subcode 1487534).
+ * This happens when the combination of page size + hourly breakdowns produces
+ * too much data for a single response.
+ */
+function isDataLimitError(body: FacebookErrorBody): boolean {
+  return body.error?.error_subcode === DATA_LIMIT_SUBCODE;
 }
 
 /**
@@ -280,9 +300,18 @@ async function fetchWithRetry(url: string): Promise<unknown> {
  *   - Ad object properties: id, effective_status
  *   - Nested insights: hourly metrics for the requested day
  *
+ * Note: We fetch ALL ads regardless of status. The assignment requires
+ * the output to include ads in every status (Active, Paused, Archived, etc.).
+ * Ads that had no activity on the requested date will simply return an
+ * empty insights block and be excluded from the final output.
+ *
+ * @param params - date, accountId, and credentials
+ * @param limit  - optional page size override (defaults to PAGE_LIMIT from config).
+ *                 Used internally when reducing page size after a data-limit error.
+ *
  * Exported for unit testing.
  */
-export function buildAdsUrl(params: FetchParams): string {
+export function buildAdsUrl(params: FetchParams, limit: number = PAGE_LIMIT): string {
   const { date, accountId, credentials } = params;
 
   // Fields we want from the nested insights block
@@ -319,7 +348,7 @@ export function buildAdsUrl(params: FetchParams): string {
   const queryParams = new URLSearchParams({
     access_token: credentials.accessToken,
     fields,
-    limit: String(PAGE_LIMIT),
+    limit: String(limit),
   });
 
   return `${BASE_URL}/act_${accountId}/ads?${queryParams.toString()}`;
@@ -330,30 +359,66 @@ export function buildAdsUrl(params: FetchParams): string {
 /**
  * Fetches ALL ad objects (with nested insights) from the account,
  * following pagination cursors until no more pages remain.
+ *
+ * Handles Facebook's "data per call" limit (subcode 1487534) by
+ * automatically halving the page size and retrying. This commonly
+ * occurs with hourly breakdowns where each ad produces up to 24 rows,
+ * causing the total data volume to exceed Facebook's per-request threshold.
  */
 async function fetchAllAds(params: FetchParams): Promise<FacebookAdObject[]> {
   const allAds: FacebookAdObject[] = [];
-  let url: string | null = buildAdsUrl(params);
+  let currentLimit = PAGE_LIMIT;
+  let url: string | null = buildAdsUrl(params, currentLimit);
   let pageNum = 1;
 
   while (url) {
-    console.log(`   Fetching page ${pageNum}…`);
+    console.log(`   Fetching page ${pageNum} (limit=${currentLimit})…`);
 
-    const response = (await fetchWithRetry(url)) as FacebookAdsResponse;
+    try {
+      const response = (await fetchWithRetry(url)) as FacebookAdsResponse;
 
-    if (response.data && response.data.length > 0) {
-      allAds.push(...response.data);
-      console.log(
-        `   ✓ Page ${pageNum}: received ${response.data.length} ads ` +
-          `(total so far: ${allAds.length})`
-      );
-    } else {
-      console.log(`   ✓ Page ${pageNum}: no ads returned.`);
+      if (response.data && response.data.length > 0) {
+        allAds.push(...response.data);
+        console.log(
+          `   ✓ Page ${pageNum}: received ${response.data.length} ads ` +
+            `(total so far: ${allAds.length})`
+        );
+      } else {
+        console.log(`   ✓ Page ${pageNum}: no ads returned.`);
+      }
+
+      // Move to next page if available
+      url = response.paging?.next ?? null;
+      pageNum++;
+    } catch (err) {
+      // ── Data-per-call limit: halve the page size and retry ──────────
+      if (
+        err instanceof FacebookApiError &&
+        err.subcode === DATA_LIMIT_SUBCODE
+      ) {
+        const newLimit = Math.floor(currentLimit / 2);
+
+        if (newLimit < MIN_PAGE_LIMIT) {
+          throw new FacebookApiError(
+            `Data per call limit exceeded even at limit=${currentLimit}. ` +
+              `Cannot reduce below MIN_PAGE_LIMIT (${MIN_PAGE_LIMIT}).`,
+            err.code,
+            err.subcode
+          );
+        }
+
+        console.warn(
+          `⚠  Data per call limit hit (subcode ${DATA_LIMIT_SUBCODE}). ` +
+            `Reducing page size from ${currentLimit} to ${newLimit} and retrying…`
+        );
+        currentLimit = newLimit;
+        url = buildAdsUrl(params, currentLimit);
+        // Don't increment pageNum — we're retrying the same page
+        continue;
+      }
+
+      throw err;
     }
-
-    // Move to next page if available
-    url = response.paging?.next ?? null;
-    pageNum++;
   }
 
   return allAds;
@@ -368,6 +433,14 @@ async function fetchAllAds(params: FetchParams): Promise<FacebookAdObject[]> {
  *   - Numeric strings → numbers
  *   - actions array → simplified { type, count } objects
  *   - purchase_roas / action_values → extracted if present
+ *
+ * Conversion note:
+ *   The `purchase_roas` and `purchase_value` fields specifically target
+ *   purchase-type conversions (omni_purchase / purchase). Different advertisers
+ *   may track other conversion types (e.g., lead, complete_registration,
+ *   add_to_cart) as their primary KPI. All conversion types are available
+ *   in the `actions` array regardless — the dedicated fields are a convenience
+ *   for the most common e-commerce use case.
  *
  * Exported for unit testing.
  */
