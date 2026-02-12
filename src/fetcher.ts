@@ -185,7 +185,7 @@ function getWaitTimeFromHeaders(response: Response): number {
  *   - Authentication errors (expired token, missing permissions)
  *   - Other client errors (bad request, etc.)
  */
-async function fetchWithRetry(url: string): Promise<unknown> {
+async function fetchWithRetry<T>(url: string): Promise<T> {
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -250,7 +250,7 @@ async function fetchWithRetry(url: string): Promise<unknown> {
         );
       }
 
-      return body;
+      return body as T;
     } catch (err) {
       // Don't retry auth errors or known API errors
       if (
@@ -375,7 +375,7 @@ async function fetchAllAds(params: FetchParams): Promise<FacebookAdObject[]> {
     console.log(`   Fetching page ${pageNum} (limit=${currentLimit})…`);
 
     try {
-      const response = (await fetchWithRetry(url)) as FacebookAdsResponse;
+      const response: FacebookAdsResponse = await fetchWithRetry<FacebookAdsResponse>(url);
 
       if (response.data && response.data.length > 0) {
         allAds.push(...response.data);
