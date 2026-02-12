@@ -3,10 +3,6 @@
  *
  * Based on the Meta Marketing API Insights endpoint:
  * https://developers.facebook.com/docs/marketing-api/insights
- *
- * We use Field Expansion to fetch ad object properties (like effective_status)
- * together with insights data in a single API call:
- * https://developers.facebook.com/docs/graph-api/using-graph-api/#field-expansion
  */
 
 // ─── Credentials & Configuration ─────────────────────────────────────────────
@@ -39,7 +35,7 @@ export interface FacebookActionValue {
   value: string;
 }
 
-/** Raw insight row returned inside the field-expansion `insights` block */
+/** Raw insight row returned by the Facebook Insights API */
 export interface FacebookInsightRow {
   account_id: string;
   account_currency: string;
@@ -70,27 +66,17 @@ export interface FacebookPaging {
   next?: string;
 }
 
-/** The nested insights object inside each ad (field expansion response) */
-export interface FacebookInsightsBlock {
+/** Response envelope from GET /act_{id}/insights?level=ad */
+export interface FacebookInsightsResponse {
   data: FacebookInsightRow[];
   paging?: FacebookPaging;
 }
 
 /**
- * A single ad object returned by GET /act_{id}/ads with field expansion.
- * Contains ad-level properties (id, effective_status) and a nested `insights` block.
+ * Response from GET /?ids=id1,id2,...&fields=effective_status
+ * Returns a map of ad ID → ad object with status.
  */
-export interface FacebookAdObject {
-  id: string;
-  effective_status: string;
-  insights?: FacebookInsightsBlock;
-}
-
-/** Response envelope from GET /act_{id}/ads */
-export interface FacebookAdsResponse {
-  data: FacebookAdObject[];
-  paging?: FacebookPaging;
-}
+export type FacebookStatusMap = Record<string, { id: string; effective_status: string }>;
 
 // ─── Normalized Output Types ─────────────────────────────────────────────────
 

@@ -19,21 +19,13 @@ export const API_VERSION = "v21.0";
 export const BASE_URL = `https://graph.facebook.com/${API_VERSION}`;
 
 /**
- * Maximum number of ads per page when fetching from the /ads endpoint.
+ * Default page size used when building the Insights URL.
  *
- * We use a conservative default (50) rather than Facebook's maximum (500)
- * because with hourly breakdowns each ad can produce up to 24 insight rows.
- * A high limit risks hitting Facebook's "data per call" threshold
- * (error subcode 1487534), which rejects the entire response.
+ * This value is passed as the `limit` parameter to the Facebook Insights API.
+ * Since we use async reports (POST) for the actual data fetching, this mainly
+ * serves as a hint. Report results are fetched separately with a larger limit.
  */
-export const PAGE_LIMIT = 50;
-
-/**
- * Minimum page limit we'll reduce to when handling data-per-call errors.
- * If we're still hitting the limit at this size, we throw instead of
- * reducing further.
- */
-export const MIN_PAGE_LIMIT = 10;
+export const PAGE_LIMIT = 25;
 
 /** Maximum number of retries on transient / rate-limit errors */
 export const MAX_RETRIES = 3;

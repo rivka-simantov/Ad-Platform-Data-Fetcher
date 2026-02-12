@@ -1,27 +1,31 @@
 /**
  * Facebook (Meta) Marketing API – Ad Data Fetcher
  *
- * This module fetches ad-level hourly performance data using a SINGLE API call
- * via Facebook's Field Expansion feature. Instead of making two separate calls
- * (one for insights, one for ad status), we query the /ads endpoint and embed
- * the insights data inside each ad object using the syntax:
+ * This module fetches ad-level hourly performance data using an
+ * "insights-first" strategy:
  *
- *   GET /act_{id}/ads?fields=effective_status,insights.time_range(...).breakdowns(...){fields...}
+ *   1. GET /act_{id}/insights?level=ad&breakdowns=hourly_stats_aggregated_by_advertiser_time_zone
+ *      → Returns ONLY ads that had activity on the requested date (with hourly metrics).
  *
- * This returns each ad object with its `effective_status` AND a nested
- * `insights` block containing the hourly performance metrics.
+ *   2. GET /?ids=ad1,ad2,...&fields=effective_status
+ *      → Fetches the status (ACTIVE/PAUSED/etc.) for just those ads.
+ *
+ * Why not use the /ads endpoint with Field Expansion?
+ *   The /ads endpoint returns ALL ads ever created in the account (including
+ *   thousands of archived/paused historical ads). For large accounts, this
+ *   results in fetching thousands of ad objects — most with empty insights —
+ *   which is extremely slow. The Insights API only returns ads with actual data.
  *
  * API references:
  *   Insights API:       https://developers.facebook.com/docs/marketing-api/insights
- *   Field Expansion:    https://developers.facebook.com/docs/graph-api/using-graph-api/#field-expansion
  *   Breakdowns:         https://developers.facebook.com/docs/marketing-api/insights/breakdowns
  *   Rate Limiting:      https://developers.facebook.com/docs/marketing-api/overview/rate-limiting
  */
 
 import {
   FetchParams,
-  FacebookAdsResponse,
-  FacebookAdObject,
+  FacebookInsightsResponse,
+  FacebookStatusMap,
   FacebookInsightRow,
   AdHourlyRecord,
   OutputFile,
@@ -29,7 +33,6 @@ import {
 import {
   BASE_URL,
   PAGE_LIMIT,
-  MIN_PAGE_LIMIT,
   MAX_RETRIES,
 } from "./config";
 import {
@@ -85,16 +88,6 @@ const RATE_LIMIT_ERROR_CODES = new Set([4, 17, 613, 80000, 80003, 80004, 80014])
  */
 const AUTH_ERROR_CODES = new Set([190, 10, 200]);
 
-/**
- * Facebook "data per call" limit error subcode.
- *
- * When using hourly breakdowns, each ad can produce up to 24 insight rows.
- * If the page size is too large, the total data volume exceeds Facebook's
- * per-request threshold and the API returns error subcode 1487534.
- * Our strategy: catch this error, halve the page limit, and retry.
- */
-const DATA_LIMIT_SUBCODE = 1487534;
-
 /** Default wait time when rate-limited (5 minutes — safe for development tier) */
 const DEFAULT_RATE_LIMIT_WAIT_MS = 5 * 60 * 1000;
 
@@ -118,15 +111,6 @@ function isRateLimitError(body: FacebookErrorBody): boolean {
  */
 function isAuthError(body: FacebookErrorBody): boolean {
   return !!body.error?.code && AUTH_ERROR_CODES.has(body.error.code);
-}
-
-/**
- * Checks if a Facebook API error is a "data per call limit" error (subcode 1487534).
- * This happens when the combination of page size + hourly breakdowns produces
- * too much data for a single response.
- */
-function isDataLimitError(body: FacebookErrorBody): boolean {
-  return body.error?.error_subcode === DATA_LIMIT_SUBCODE;
 }
 
 /**
@@ -176,7 +160,7 @@ function getWaitTimeFromHeaders(response: Response): number {
 // ─── HTTP wrapper with retry logic ───────────────────────────────────────────
 
 /**
- * Performs a GET request with retry logic for:
+ * Performs an HTTP request (GET or POST) with retry logic for:
  *   - Facebook rate-limit errors (codes 4, 17, 613, 80000–80014)
  *   - Server errors (HTTP 5xx) with exponential backoff + jitter
  *   - Network failures (ECONNRESET, fetch failures)
@@ -184,26 +168,42 @@ function getWaitTimeFromHeaders(response: Response): number {
  * Throws immediately (no retry) for:
  *   - Authentication errors (expired token, missing permissions)
  *   - Other client errors (bad request, etc.)
+ *
+ * @param url  - The URL to fetch
+ * @param init - Optional RequestInit (e.g., { method: "POST" } for async reports)
  */
-async function fetchWithRetry<T>(url: string): Promise<T> {
+async function fetchWithRetry<T>(url: string, init?: RequestInit): Promise<T> {
   let lastError: Error | null = null;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const response = await fetch(url);
+      const response = await fetch(url, init);
 
-      // ── Server error – retry with exponential backoff + jitter ────────
-      if (response.status >= 500) {
-        const backoff = backoffWithJitter(attempt);
-        console.warn(
-          `⚠  Server error ${response.status} (attempt ${attempt}/${MAX_RETRIES}). ` +
-            `Retrying in ${(backoff / 1000).toFixed(1)}s…`
+      // Parse JSON body for ALL responses (including 5xx).
+      // Facebook often returns HTTP 500 with a JSON body containing a
+      // specific error code (e.g., code 1 = "reduce data"). We need to
+      // read the body first so we can classify the error properly.
+      let body: FacebookErrorBody;
+      try {
+        body = await response.json() as FacebookErrorBody;
+      } catch {
+        // If we can't parse JSON on a 5xx, treat as a generic server error
+        if (response.status >= 500) {
+          const backoff = backoffWithJitter(attempt);
+          console.warn(
+            `⚠  Server error ${response.status} (attempt ${attempt}/${MAX_RETRIES}). ` +
+              `Retrying in ${(backoff / 1000).toFixed(1)}s…`
+          );
+          lastError = new Error(`Server error ${response.status} (non-JSON body)`);
+          await sleep(backoff);
+          continue;
+        }
+        throw new FacebookApiError(
+          `HTTP ${response.status}: non-JSON response`,
+          response.status,
+          undefined
         );
-        await sleep(backoff);
-        continue;
       }
-
-      const body = await response.json() as FacebookErrorBody;
 
       // ── Authentication error – throw immediately, no retry ───────────
       if (body.error && isAuthError(body)) {
@@ -231,6 +231,18 @@ async function fetchWithRetry<T>(url: string): Promise<T> {
         );
         await sleep(waitMs);
         continue;
+      }
+
+      // ── Generic server error with JSON body – retry ───────────────────
+      if (response.status >= 500 && body.error) {
+        // Throw so the caller (e.g., fetchAllInsights) can decide whether
+        // to reduce limits or just retry. This handles Facebook's code 1
+        // ("Please reduce the amount of data") which arrives as HTTP 500.
+        throw new FacebookApiError(
+          body.error.message ?? `Server error ${response.status}`,
+          body.error.code,
+          body.error.error_subcode
+        );
       }
 
       // ── Other API error – throw immediately ──────────────────────────
@@ -287,35 +299,28 @@ async function fetchWithRetry<T>(url: string): Promise<T> {
   );
 }
 
-// ─── Build the /ads URL with Field Expansion ─────────────────────────────────
+// ─── Build the Insights URL ──────────────────────────────────────────────────
 
 /**
- * Constructs the URL for GET /act_{id}/ads using Field Expansion to embed
- * insights data inside each ad object.
+ * Constructs the URL for GET /act_{id}/insights with ad-level hourly breakdown.
  *
  * The resulting URL looks like:
- *   /act_{id}/ads?fields=effective_status,insights.time_range({...}).breakdowns(...){fields}
+ *   /act_{id}/insights?level=ad&time_range={...}&breakdowns=hourly_stats_...&fields=...
  *
- * This fetches both:
- *   - Ad object properties: id, effective_status
- *   - Nested insights: hourly metrics for the requested day
- *
- * Note: We fetch ALL ads regardless of status. The assignment requires
- * the output to include ads in every status (Active, Paused, Archived, etc.).
- * Ads that had no activity on the requested date will simply return an
- * empty insights block and be excluded from the final output.
+ * Unlike the /ads endpoint (which returns ALL ads ever created in the account),
+ * the Insights endpoint ONLY returns ads that had actual activity (impressions,
+ * clicks, spend) on the requested date. This is dramatically faster for large
+ * accounts that may have thousands of historical ads.
  *
  * @param params - date, accountId, and credentials
  * @param limit  - optional page size override (defaults to PAGE_LIMIT from config).
- *                 Used internally when reducing page size after a data-limit error.
  *
  * Exported for unit testing.
  */
-export function buildAdsUrl(params: FetchParams, limit: number = PAGE_LIMIT): string {
+export function buildInsightsUrl(params: FetchParams, limit: number = PAGE_LIMIT): string {
   const { date, accountId, credentials } = params;
 
-  // Fields we want from the nested insights block
-  const insightsFields = [
+  const fields = [
     "account_id",
     "account_currency",
     "campaign_id",
@@ -333,95 +338,217 @@ export function buildAdsUrl(params: FetchParams, limit: number = PAGE_LIMIT): st
     "purchase_roas",
   ].join(",");
 
-  // Build the field expansion expression for insights
-  // Syntax: insights.time_range({...}).breakdowns(...){field1,field2,...}
-  const timeRange = `{"since":"${date}","until":"${date}"}`;
-  const insightsExpansion =
-    `insights` +
-    `.time_range(${timeRange})` +
-    `.breakdowns(hourly_stats_aggregated_by_advertiser_time_zone)` +
-    `{${insightsFields}}`;
-
-  // Top-level fields: ad properties + nested insights
-  const fields = `effective_status,${insightsExpansion}`;
-
   const queryParams = new URLSearchParams({
     access_token: credentials.accessToken,
+    level: "ad",
+    time_range: JSON.stringify({ since: date, until: date }),
+    breakdowns: "hourly_stats_aggregated_by_advertiser_time_zone",
     fields,
     limit: String(limit),
   });
 
-  return `${BASE_URL}/act_${accountId}/ads?${queryParams.toString()}`;
+  return `${BASE_URL}/act_${accountId}/insights?${queryParams.toString()}`;
 }
 
-// ─── Fetch all pages of ads ──────────────────────────────────────────────────
+/**
+ * Constructs a URL to fetch effective_status for a batch of ad IDs.
+ *
+ * Uses the Graph API batch-by-IDs syntax:
+ *   GET /?ids=id1,id2,...&fields=effective_status
+ *
+ * This is used after fetching insights to get the status of only the
+ * ads that had activity — typically just a handful of IDs.
+ *
+ * Exported for unit testing.
+ */
+export function buildStatusUrl(adIds: string[], accessToken: string): string {
+  const queryParams = new URLSearchParams({
+    ids: adIds.join(","),
+    fields: "effective_status",
+    access_token: accessToken,
+  });
+
+  return `${BASE_URL}/?${queryParams.toString()}`;
+}
+
+// ─── Async Insights Report ───────────────────────────────────────────────────
+
+/** Response from POST /act_{id}/insights (async report creation) */
+interface ReportRunResponse {
+  report_run_id: string;
+}
+
+/** Response from GET /{report_run_id} (report status polling) */
+interface ReportStatusResponse {
+  id: string;
+  async_status: string;
+  async_percent_completion: number;
+}
+
+/** How often to poll for report completion (in ms) */
+const REPORT_POLL_INTERVAL_MS = 5_000;
+
+/** Maximum time to wait for a report before giving up (5 minutes) */
+const REPORT_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
- * Fetches ALL ad objects (with nested insights) from the account,
- * following pagination cursors until no more pages remain.
+ * Creates an async insights report via POST.
  *
- * Handles Facebook's "data per call" limit (subcode 1487534) by
- * automatically halving the page size and retrying. This commonly
- * occurs with hourly breakdowns where each ad produces up to 24 rows,
- * causing the total data volume to exceed Facebook's per-request threshold.
+ * The Facebook Insights API returns HTTP 500 with error code 1
+ * ("Please reduce the amount of data") for complex queries like
+ * hourly breakdowns at the ad level. The solution is to use the
+ * async report flow:
+ *   1. POST to create the report (this function)
+ *   2. Poll until the report is ready
+ *   3. Fetch the results with pagination
+ *
+ * @returns The report_run_id used to poll and fetch results.
  */
-async function fetchAllAds(params: FetchParams): Promise<FacebookAdObject[]> {
-  const allAds: FacebookAdObject[] = [];
-  let currentLimit = PAGE_LIMIT;
-  let url: string | null = buildAdsUrl(params, currentLimit);
+async function createInsightsReport(params: FetchParams): Promise<string> {
+  const url = buildInsightsUrl(params);
+
+  console.log("   Creating async insights report…");
+  const response = await fetchWithRetry<ReportRunResponse>(url, { method: "POST" });
+
+  if (!response.report_run_id) {
+    throw new FacebookApiError(
+      "POST /insights did not return a report_run_id",
+      undefined,
+      undefined
+    );
+  }
+
+  console.log(`   ✓ Report created: ${response.report_run_id}`);
+  return response.report_run_id;
+}
+
+/**
+ * Polls a report until its async_status is "Job Completed".
+ *
+ * Facebook processes the report in the background. We poll every few
+ * seconds and log progress percentage until it finishes.
+ */
+async function waitForReport(reportId: string, accessToken: string): Promise<void> {
+  const statusUrl = `${BASE_URL}/${reportId}?` +
+    new URLSearchParams({
+      fields: "async_status,async_percent_completion",
+      access_token: accessToken,
+    }).toString();
+
+  const startTime = Date.now();
+
+  while (true) {
+    const status = await fetchWithRetry<ReportStatusResponse>(statusUrl);
+
+    if (status.async_status === "Job Completed") {
+      console.log("   ✓ Report ready (100%).");
+      return;
+    }
+
+    if (status.async_status === "Job Failed" || status.async_status === "Job Skipped") {
+      throw new FacebookApiError(
+        `Insights report failed with status: ${status.async_status}`,
+        undefined,
+        undefined
+      );
+    }
+
+    if (Date.now() - startTime > REPORT_TIMEOUT_MS) {
+      throw new FacebookApiError(
+        `Insights report timed out after ${REPORT_TIMEOUT_MS / 1000}s ` +
+          `(status: ${status.async_status}, ${status.async_percent_completion}%)`,
+        undefined,
+        undefined
+      );
+    }
+
+    console.log(
+      `   ⏳ Report ${status.async_status} ` +
+        `(${status.async_percent_completion}%)… waiting ${REPORT_POLL_INTERVAL_MS / 1000}s`
+    );
+    await sleep(REPORT_POLL_INTERVAL_MS);
+  }
+}
+
+/**
+ * Fetches the completed report results with pagination.
+ */
+async function fetchReportResults(
+  reportId: string,
+  accessToken: string
+): Promise<FacebookInsightRow[]> {
+  const allRows: FacebookInsightRow[] = [];
+  let url: string | null = `${BASE_URL}/${reportId}/insights?` +
+    new URLSearchParams({
+      access_token: accessToken,
+      limit: "500",
+    }).toString();
   let pageNum = 1;
 
   while (url) {
-    console.log(`   Fetching page ${pageNum} (limit=${currentLimit})…`);
+    console.log(`   Fetching results page ${pageNum}…`);
 
-    try {
-      const response: FacebookAdsResponse = await fetchWithRetry<FacebookAdsResponse>(url);
+    const response: FacebookInsightsResponse =
+      await fetchWithRetry<FacebookInsightsResponse>(url);
 
-      if (response.data && response.data.length > 0) {
-        allAds.push(...response.data);
-        console.log(
-          `   ✓ Page ${pageNum}: received ${response.data.length} ads ` +
-            `(total so far: ${allAds.length})`
-        );
-      } else {
-        console.log(`   ✓ Page ${pageNum}: no ads returned.`);
-      }
-
-      // Move to next page if available
-      url = response.paging?.next ?? null;
-      pageNum++;
-    } catch (err) {
-      // ── Data-per-call limit: halve the page size and retry ──────────
-      if (
-        err instanceof FacebookApiError &&
-        err.subcode === DATA_LIMIT_SUBCODE
-      ) {
-        const newLimit = Math.floor(currentLimit / 2);
-
-        if (newLimit < MIN_PAGE_LIMIT) {
-          throw new FacebookApiError(
-            `Data per call limit exceeded even at limit=${currentLimit}. ` +
-              `Cannot reduce below MIN_PAGE_LIMIT (${MIN_PAGE_LIMIT}).`,
-            err.code,
-            err.subcode
-          );
-        }
-
-        console.warn(
-          `⚠  Data per call limit hit (subcode ${DATA_LIMIT_SUBCODE}). ` +
-            `Reducing page size from ${currentLimit} to ${newLimit} and retrying…`
-        );
-        currentLimit = newLimit;
-        url = buildAdsUrl(params, currentLimit);
-        // Don't increment pageNum — we're retrying the same page
-        continue;
-      }
-
-      throw err;
+    if (response.data && response.data.length > 0) {
+      allRows.push(...response.data);
+      console.log(
+        `   ✓ Page ${pageNum}: received ${response.data.length} rows ` +
+          `(total so far: ${allRows.length})`
+      );
+    } else {
+      console.log(`   ✓ Page ${pageNum}: no rows returned.`);
     }
+
+    url = response.paging?.next ?? null;
+    pageNum++;
   }
 
-  return allAds;
+  return allRows;
+}
+
+/**
+ * Fetches all insight rows using the async report workflow:
+ *   1. POST to create report → returns report_run_id
+ *   2. Poll GET /{id} until async_status = "Job Completed"
+ *   3. GET /{id}/insights with pagination to download results
+ *
+ * This approach works reliably regardless of data volume, unlike the
+ * synchronous GET which fails with error code 1 for complex queries.
+ */
+async function fetchAllInsights(params: FetchParams): Promise<FacebookInsightRow[]> {
+  const reportId = await createInsightsReport(params);
+  await waitForReport(reportId, params.credentials.accessToken);
+  return fetchReportResults(reportId, params.credentials.accessToken);
+}
+
+// ─── Fetch ad statuses ───────────────────────────────────────────────────────
+
+/**
+ * Fetches the effective_status for a set of ad IDs using a single API call.
+ *
+ * Uses the Graph API batch-by-IDs syntax: GET /?ids=id1,id2,...&fields=effective_status
+ * Returns a map of ad ID → status string.
+ */
+async function fetchAdStatuses(
+  adIds: string[],
+  accessToken: string
+): Promise<Record<string, string>> {
+  if (adIds.length === 0) return {};
+
+  console.log(`   Fetching status for ${adIds.length} ads…`);
+
+  const url = buildStatusUrl(adIds, accessToken);
+  const response = await fetchWithRetry<FacebookStatusMap>(url);
+
+  const statusMap: Record<string, string> = {};
+  for (const [id, obj] of Object.entries(response)) {
+    statusMap[id] = obj.effective_status ?? "UNKNOWN";
+  }
+
+  console.log(`   ✓ Received statuses for ${Object.keys(statusMap).length} ads.`);
+  return statusMap;
 }
 
 // ─── Normalize raw data into clean output ────────────────────────────────────
@@ -513,7 +640,16 @@ function computeSummary(records: AdHourlyRecord[]) {
 
 /**
  * Main entry point: fetches ad-level hourly performance data for a single day
- * from the Facebook Marketing API using a single API call with Field Expansion.
+ * from the Facebook Marketing API.
+ *
+ * Strategy (insights-first):
+ *   1. Fetch insights with level=ad — returns ONLY ads with activity on the date.
+ *   2. Collect unique ad IDs from the results.
+ *   3. Fetch effective_status for those specific ads (single batch call).
+ *   4. Merge statuses into the normalized output.
+ *
+ * This is dramatically faster than the /ads endpoint for large accounts,
+ * which would iterate through every ad ever created.
  *
  * @param params - date, accountId, and credentials
  * @returns A complete OutputFile object ready to be written to disk as JSON.
@@ -523,20 +659,34 @@ export async function fetchAdData(params: FetchParams): Promise<OutputFile> {
     `\n📊 Fetching ad data for account ${params.accountId} on ${params.date}…\n`
   );
 
-  // Single API call: fetch ads with nested insights via field expansion
-  const ads = await fetchAllAds(params);
+  // Step 1: Fetch insights — only returns ads with activity on this date
+  const insightRows = await fetchAllInsights(params);
 
-  // Flatten: each ad may have multiple hourly insight rows
-  const normalizedData: AdHourlyRecord[] = [];
+  // Step 2: Collect unique ad IDs from the insight rows
+  const uniqueAdIds = [...new Set(insightRows.map((r) => r.ad_id))];
+  console.log(`\n   Found ${uniqueAdIds.length} unique ads with activity.`);
 
-  for (const ad of ads) {
-    const status = ad.effective_status ?? "UNKNOWN";
-    const insightRows = ad.insights?.data ?? [];
+  // Step 3: Fetch statuses for those specific ads
+  const statusMap = await fetchAdStatuses(
+    uniqueAdIds,
+    params.credentials.accessToken
+  );
 
-    for (const row of insightRows) {
-      normalizedData.push(normalizeRow(row, status));
-    }
+  // Log status distribution for visibility
+  const statusCounts: Record<string, number> = {};
+  for (const status of Object.values(statusMap)) {
+    statusCounts[status] = (statusCounts[status] ?? 0) + 1;
   }
+  console.log(`\n   Status distribution:`);
+  for (const [status, count] of Object.entries(statusCounts).sort((a, b) => b[1] - a[1])) {
+    console.log(`   ├─ ${status}: ${count}`);
+  }
+
+  // Step 4: Normalize each insight row with its ad status
+  const normalizedData: AdHourlyRecord[] = insightRows.map((row) => {
+    const status = statusMap[row.ad_id] ?? "UNKNOWN";
+    return normalizeRow(row, status);
+  });
 
   if (normalizedData.length === 0) {
     console.log(
@@ -560,7 +710,7 @@ export async function fetchAdData(params: FetchParams): Promise<OutputFile> {
   };
 
   console.log(
-    `\n✅ Fetched ${ads.length} ads → ${normalizedData.length} hourly records.\n`
+    `\n✅ ${uniqueAdIds.length} ads → ${normalizedData.length} hourly records.\n`
   );
 
   return output;

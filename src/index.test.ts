@@ -9,7 +9,7 @@
  */
 
 import { validateDate, validateAccountId } from "./config";
-import { normalizeRow, buildAdsUrl } from "./fetcher";
+import { normalizeRow, buildInsightsUrl, buildStatusUrl } from "./fetcher";
 import { FacebookInsightRow, FetchParams } from "./types";
 import {
   FacebookApiError,
@@ -162,44 +162,43 @@ describe("normalizeRow", () => {
   });
 });
 
-// ─── buildAdsUrl ─────────────────────────────────────────────────────────────
+// ─── buildInsightsUrl ────────────────────────────────────────────────────────
 
-describe("buildAdsUrl", () => {
+describe("buildInsightsUrl", () => {
   const params: FetchParams = {
     date: "2025-01-15",
     accountId: "123456789",
     credentials: { accessToken: "test_token_123" },
   };
 
-  it("targets the /ads endpoint with the correct account ID", () => {
-    const url = buildAdsUrl(params);
-    expect(url).toContain("/act_123456789/ads");
+  it("targets the /insights endpoint with the correct account ID", () => {
+    const url = buildInsightsUrl(params);
+    expect(url).toContain("/act_123456789/insights");
   });
 
   it("includes the access token", () => {
-    const url = buildAdsUrl(params);
+    const url = buildInsightsUrl(params);
     expect(url).toContain("access_token=test_token_123");
   });
 
-  it("includes effective_status in the fields", () => {
-    const url = buildAdsUrl(params);
-    expect(url).toContain("effective_status");
+  it("uses level=ad to get ad-level data", () => {
+    const url = buildInsightsUrl(params);
+    expect(url).toContain("level=ad");
   });
 
-  it("uses field expansion syntax for insights", () => {
-    const url = decodeURIComponent(buildAdsUrl(params));
-    expect(url).toContain("insights.time_range");
-    expect(url).toContain(".breakdowns(hourly_stats_aggregated_by_advertiser_time_zone)");
+  it("includes hourly breakdown", () => {
+    const url = buildInsightsUrl(params);
+    expect(url).toContain("breakdowns=hourly_stats_aggregated_by_advertiser_time_zone");
   });
 
   it("includes the correct time_range for the requested date", () => {
-    const url = decodeURIComponent(buildAdsUrl(params));
+    const url = decodeURIComponent(buildInsightsUrl(params));
     expect(url).toContain('"since":"2025-01-15"');
     expect(url).toContain('"until":"2025-01-15"');
   });
 
-  it("requests all required metrics in the insights block", () => {
-    const url = buildAdsUrl(params);
+  it("requests all required metrics in the fields", () => {
+    const url = buildInsightsUrl(params);
     const requiredFields = [
       "impressions", "clicks", "spend", "actions",
       "action_values", "purchase_roas", "account_id",
@@ -211,13 +210,33 @@ describe("buildAdsUrl", () => {
   });
 
   it("includes the default page limit", () => {
-    const url = buildAdsUrl(params);
-    expect(url).toContain("limit=50");
+    const url = buildInsightsUrl(params);
+    expect(url).toContain("limit=25");
   });
 
   it("accepts a custom page limit override", () => {
-    const url = buildAdsUrl(params, 25);
+    const url = buildInsightsUrl(params, 25);
     expect(url).toContain("limit=25");
+  });
+});
+
+// ─── buildStatusUrl ──────────────────────────────────────────────────────────
+
+describe("buildStatusUrl", () => {
+  it("includes all ad IDs", () => {
+    const url = buildStatusUrl(["111", "222", "333"], "test_token");
+    const decoded = decodeURIComponent(url);
+    expect(decoded).toContain("ids=111,222,333");
+  });
+
+  it("requests effective_status field", () => {
+    const url = buildStatusUrl(["111"], "test_token");
+    expect(url).toContain("fields=effective_status");
+  });
+
+  it("includes the access token", () => {
+    const url = buildStatusUrl(["111"], "test_token");
+    expect(url).toContain("access_token=test_token");
   });
 });
 
